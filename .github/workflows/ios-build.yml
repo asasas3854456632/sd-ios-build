@@ -1,0 +1,162 @@
+name: iOS 打包（IPA）
+
+# 在 GitHub 网页上：Actions → 左侧「iOS 打包（IPA）」→ Run workflow 即可出包
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Bundle ID（留空则用项目当前值）'
+        required: false
+        default: ''
+      signed:
+        description: '是否用仓库 Secrets 里的证书签名（客户自签请保持 false）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  build-ios:
+    name: 构建 iOS IPA
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: 环境信息
+        run: |
+          flutter --version
+          xcodebuild -version
+          echo "Runner: $(sw_vers -productVersion)"
+
+      - name: 拉取依赖
+        run: flutter pub get
+
+      - name: 覆盖 Bundle ID（可选）
+        if: ${{ inputs.bundle_id != '' }}
+        run: |
+          set -e
+          BID="${{ inputs.bundle_id }}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BID" ios/Runner/Info.plist 2>/dev/null || true
+          /usr/bin/sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = $BID;/g" ios/Runner.xcodeproj/project.pbxproj
+          echo "Bundle ID 已设置为: $BID"
+          grep -c "PRODUCT_BUNDLE_IDENTIFIER = $BID;" ios/Runner.xcodeproj/project.pbxproj
+
+      - name: 编译（不签名）
+        run: flutter build ios --release --no-codesign
+
+      - name: 打包未签名 IPA
+        run: |
+          set -e
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          test -d "$APP_PATH"
+          rm -rf Payload unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr unsigned.ipa Payload
+          echo "未签名 IPA 大小: $(du -h unsigned.ipa | cut -f1)"
+          echo "结构检查:"
+          unzip -l unsigned.ipa | head -8
+
+      # ================== 以下为「可选」签名步骤 ==================
+      # 客户自己找签名渠道时不需要；若要出已签名包（App Store 类型），
+      # 需在仓库 Secrets 配置 IOS_P12_BASE64 / IOS_P12_PASSWORD / IOS_PROVISION_BASE64 / IOS_BUNDLE_ID
+      - name: 导入证书（可选）
+        if: ${{ inputs.signed == 'true' }}
+        env:
+          P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          PROVISION_BASE64: ${{ secrets.IOS_PROVISION_BASE64 }}
+        run: |
+          set -e
+          if [ -z "$P12_BASE64" ] || [ -z "$PROVISION_BASE64" ]; then
+            echo "::error::未配置证书 Secrets，无法签名"
+            exit 1
+          fi
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+          echo "$PROVISION_BASE64" | base64 --decode > /tmp/profile.mobileprovision
+          KEYCHAIN=build.keychain
+          security create-keychain -p actions "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          security import /tmp/cert.p12 -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KEYCHAIN"
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp /tmp/profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+          echo "证书与描述文件已导入"
+
+      - name: 签名并导出 IPA（可选）
+        if: ${{ inputs.signed == 'true' }}
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id != '' && inputs.bundle_id || secrets.IOS_BUNDLE_ID }}
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        run: |
+          set -e
+          METHOD="${EXPORT_METHOD:-app-store}"
+          PROFILE_NAME=$(security cms -D -i /tmp/profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin)
+          TEAM="${TEAM_ID:-$(security cms -D -i /tmp/profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' /dev/stdin)}"
+          echo "描述文件名: $PROFILE_NAME  团队: $TEAM  导出方式: $METHOD"
+          cat > /tmp/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>${METHOD}</string>
+            <key>teamID</key>
+            <string>${TEAM}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>compileBitcode</key>
+            <false/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>${PROFILE_NAME}</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner -configuration Release \
+            -archivePath /tmp/Runner.xcarchive archive \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$TEAM" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            -allowProvisioningUpdates || true
+          rm -rf /tmp/ipa && mkdir -p /tmp/ipa
+          xcodebuild -exportArchive -archivePath /tmp/Runner.xcarchive \
+            -exportPath /tmp/ipa -exportOptionsPlist /tmp/ExportOptions.plist \
+            -allowProvisioningUpdates
+          cp /tmp/ipa/*.ipa signed.ipa
+          echo "已签名 IPA 大小: $(du -h signed.ipa | cut -f1)"
+
+      - name: 上传产物（未签名 IPA）
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: unsigned.ipa
+          if-no-files-found: error
+
+      - name: 上传产物（已签名 IPA，可选）
+        if: ${{ inputs.signed == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-ipa
+          path: signed.ipa
+          if-no-files-found: warn
